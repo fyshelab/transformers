@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch ALBERT model. """
+"""PyTorch ALBERT model."""
 
 import math
 import os
@@ -71,7 +71,7 @@ ALBERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 
 def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
-    """ Load tf checkpoints in a pytorch model."""
+    """Load tf checkpoints in a pytorch model."""
     try:
         import re
 
@@ -198,7 +198,8 @@ def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
 
 
 class AlbertGenerationEmbeddings(nn.Module):
-    """Construct the embeddings from word, position and token_type embeddings."""
+    """Construct the embeddings from word, position and token_type
+    embeddings."""
 
     def __init__(self, config):
         super().__init__()
@@ -234,9 +235,8 @@ class AlbertGenerationEmbeddings(nn.Module):
 
 
 class AlbertEmbeddings(nn.Module):
-    """
-    Construct the embeddings from word, position and token_type embeddings.
-    """
+    """Construct the embeddings from word, position and token_type
+    embeddings."""
 
     def __init__(self, config):
         super().__init__()
@@ -334,10 +334,15 @@ class AlbertAttention(nn.Module):
         self.all_head_size = self.attention_head_size * self.num_attention_heads
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def forward(self, hidden_states, attention_mask=None, head_mask=None,
-            encoder_hidden_states=None,
-            encoder_attention_mask=None,
-            output_attentions=False):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+    ):
         mixed_query_layer = self.query(hidden_states)
 
         # if values come from the encoder.
@@ -426,17 +431,34 @@ class AlbertLayer(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
-        self, hidden_states, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, output_attentions=False, output_hidden_states=False
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+        output_hidden_states=False,
     ):
-        attention_outputs = self.attention(hidden_states, attention_mask, head_mask, output_attentions=output_attentions)
+        attention_outputs = self.attention(
+            hidden_states, attention_mask, head_mask, output_attentions=output_attentions
+        )
 
         attention_output = attention_outputs[0]
         outputs = attention_outputs[1:]
 
         if self.is_decoder and encoder_hidden_states is not None:
             assert hasattr(
-                    self, "crossattention"), f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
-            cross_attention_outputs = self.crossattention(attention_output, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask, output_attentions)
+                self, "crossattention"
+            ), f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
+            cross_attention_outputs = self.crossattention(
+                attention_output,
+                attention_mask,
+                head_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                output_attentions,
+            )
             attention_output = cross_attention_outputs[0]
             outputs = outputs + cross_attention_outputs[1:]
 
@@ -465,14 +487,29 @@ class AlbertLayerGroup(nn.Module):
         self.albert_layers = nn.ModuleList([AlbertLayer(config) for _ in range(config.inner_group_num)])
 
     def forward(
-        self, hidden_states, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, output_attentions=False, output_hidden_states=False
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+        output_hidden_states=False,
     ):
         layer_hidden_states = ()
         layer_attentions = ()
         layer_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
         for layer_index, albert_layer in enumerate(self.albert_layers):
-            layer_output = albert_layer(hidden_states, attention_mask, head_mask[layer_index], encoder_hidden_states, encoder_attention_mask, output_attentions, output_hidden_states)
+            layer_output = albert_layer(
+                hidden_states,
+                attention_mask,
+                head_mask[layer_index],
+                encoder_hidden_states,
+                encoder_attention_mask,
+                output_attentions,
+                output_hidden_states,
+            )
             hidden_states = layer_output[0]
 
             if output_attentions:
@@ -487,7 +524,10 @@ class AlbertLayerGroup(nn.Module):
         if output_hidden_states:
             outputs = outputs + (layer_hidden_states,)
         if output_attentions:
-            outputs = outputs + (layer_attentions, layer_cross_attentions, )
+            outputs = outputs + (
+                layer_attentions,
+                layer_cross_attentions,
+            )
         return outputs  # last-layer hidden state, (layer hidden states), (layer attentions)
 
 
@@ -534,25 +574,28 @@ class AlbertTransformer(nn.Module):
             hidden_states = layer_group_output[0]
 
             if output_attentions:
-                all_attentions = all_attentions + (layer_group_output[2], )
+                all_attentions = all_attentions + (layer_group_output[2],)
                 if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (layer_group_output[3], )
+                    all_cross_attentions = all_cross_attentions + (layer_group_output[3],)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions, all_cross_attentions] if v is not None)
+            return tuple(
+                v for v in [hidden_states, all_hidden_states, all_attentions, all_cross_attentions] if v is not None
+            )
         return BaseModelOutputWithCrossAttentions(
-            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions, cross_attentions=all_cross_attentions
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
         )
 
 
 class AlbertPreTrainedModel(PreTrainedModel):
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
-    """
+    """An abstract class to handle weights initialization and a simple
+    interface for downloading and loading pretrained models."""
 
     config_class = AlbertConfig
     base_model_prefix = "albert"
@@ -573,8 +616,7 @@ class AlbertPreTrainedModel(PreTrainedModel):
 
 @dataclass
 class AlbertForPreTrainingOutput(ModelOutput):
-    """
-    Output type of :class:`~transformers.AlbertForPreTraining`.
+    """Output type of :class:`~transformers.AlbertForPreTraining`.
 
     Args:
         loss (`optional`, returned when ``labels`` is provided, ``torch.FloatTensor`` of shape :obj:`(1,)`):
@@ -711,10 +753,11 @@ class AlbertModel(AlbertPreTrainedModel):
         return self.embeddings.word_embeddings
 
     def _prune_heads(self, heads_to_prune):
-        """
-        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} ALBERT has
-        a different architecture in that its layers are shared across groups, which then has inner groups. If an ALBERT
-        model has 12 hidden layers and 2 hidden groups, with two inner groups, there is a total of 4 different layers.
+        """Prunes heads of the model. heads_to_prune: dict of {layer_num: list
+        of heads to prune in this layer} ALBERT has a different architecture in
+        that its layers are shared across groups, which then has inner groups.
+        If an ALBERT model has 12 hidden layers and 2 hidden groups, with two
+        inner groups, there is a total of 4 different layers.
 
         These layers are flattened: the indices [0,1] correspond to the two inner groups of the first hidden layer,
         while [2,3] correspond to the two inner groups of the second hidden layer.
