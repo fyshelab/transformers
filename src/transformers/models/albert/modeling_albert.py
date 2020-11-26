@@ -33,6 +33,7 @@ from ...file_utils import (
 )
 from ...modeling_outputs import (
     BaseModelOutput,
+    BaseModelOutputWithCrossAttentions,
     BaseModelOutputWithPooling,
     MaskedLMOutput,
     MultipleChoiceModelOutput,
@@ -196,6 +197,42 @@ def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
     return model
 
 
+class AlbertGenerationEmbeddings(nn.Module):
+    """Construct the embeddings from word, position and token_type embeddings."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.embedding_size)
+        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
+        # any TensorFlow checkpoint file
+        self.LayerNorm = torch.nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+
+    def forward(self, input_ids=None, position_ids=None, inputs_embeds=None):
+        if input_ids is not None:
+            input_shape = input_ids.size()
+        else:
+            input_shape = inputs_embeds.size()[:-1]
+
+        seq_length = input_shape[1]
+
+        if position_ids is None:
+            position_ids = self.position_ids[:, :seq_length]
+
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+
+        embeddings = inputs_embeds + position_embeddings
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+        return embeddings
+
+
 class AlbertEmbeddings(nn.Module):
     """
     Construct the embeddings from word, position and token_type embeddings.
@@ -297,10 +334,20 @@ class AlbertAttention(nn.Module):
         self.all_head_size = self.attention_head_size * self.num_attention_heads
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def forward(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False):
+    def forward(self, hidden_states, attention_mask=None, head_mask=None,
+            encoder_hidden_states=None,
+            encoder_attention_mask=None,
+            output_attentions=False):
         mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+
+        # if values come from the encoder.
+        if encoder_hidden_states is not None:
+            mixed_key_layer = self.key(encoder_hidden_states)
+            mixed_value_layer = self.value(encoder_hidden_states)
+            attention_mask = encoder_attention_mask
+        else:
+            mixed_key_layer = self.key(hidden_states)
+            mixed_value_layer = self.value(hidden_states)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -368,25 +415,40 @@ class AlbertLayer(nn.Module):
         self.seq_len_dim = 1
         self.full_layer_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = AlbertAttention(config)
+        self.is_decoder = config.is_decoder
+        self.add_cross_attention = config.add_cross_attention
+        if self.add_cross_attention:
+            assert self.is_decoder, f"{self} should be used as a decoder model if cross attention is added"
+            self.crossattention = AlbertAttention(config)
         self.ffn = nn.Linear(config.hidden_size, config.intermediate_size)
         self.ffn_output = nn.Linear(config.intermediate_size, config.hidden_size)
         self.activation = ACT2FN[config.hidden_act]
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
-        self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False, output_hidden_states=False
+        self, hidden_states, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, output_attentions=False, output_hidden_states=False
     ):
-        attention_output = self.attention(hidden_states, attention_mask, head_mask, output_attentions)
+        attention_outputs = self.attention(hidden_states, attention_mask, head_mask, output_attentions=output_attentions)
+
+        attention_output = attention_outputs[0]
+        outputs = attention_outputs[1:]
+
+        if self.is_decoder and encoder_hidden_states is not None:
+            assert hasattr(
+                    self, "crossattention"), f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
+            cross_attention_outputs = self.crossattention(attention_output, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask, output_attentions)
+            attention_output = cross_attention_outputs[0]
+            outputs = outputs + cross_attention_outputs[1:]
 
         ffn_output = apply_chunking_to_forward(
             self.ff_chunk,
             self.chunk_size_feed_forward,
             self.seq_len_dim,
-            attention_output[0],
+            attention_output,
         )
-        hidden_states = self.full_layer_layer_norm(ffn_output + attention_output[0])
+        hidden_states = self.full_layer_layer_norm(ffn_output + attention_output)
 
-        return (hidden_states,) + attention_output[1:]  # add attentions if we output them
+        return (hidden_states,) + outputs  # add attentions if we output them
 
     def ff_chunk(self, attention_output):
         ffn_output = self.ffn(attention_output)
@@ -399,20 +461,24 @@ class AlbertLayerGroup(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.config = config
         self.albert_layers = nn.ModuleList([AlbertLayer(config) for _ in range(config.inner_group_num)])
 
     def forward(
-        self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False, output_hidden_states=False
+        self, hidden_states, attention_mask=None, head_mask=None, encoder_hidden_states=None, encoder_attention_mask=None, output_attentions=False, output_hidden_states=False
     ):
         layer_hidden_states = ()
         layer_attentions = ()
+        layer_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
         for layer_index, albert_layer in enumerate(self.albert_layers):
-            layer_output = albert_layer(hidden_states, attention_mask, head_mask[layer_index], output_attentions)
+            layer_output = albert_layer(hidden_states, attention_mask, head_mask[layer_index], encoder_hidden_states, encoder_attention_mask, output_attentions, output_hidden_states)
             hidden_states = layer_output[0]
 
             if output_attentions:
                 layer_attentions = layer_attentions + (layer_output[1],)
+                if self.config.add_cross_attention:
+                    layer_cross_attentions = layer_cross_attentions + (layer_outputs[2],)
 
             if output_hidden_states:
                 layer_hidden_states = layer_hidden_states + (hidden_states,)
@@ -421,7 +487,7 @@ class AlbertLayerGroup(nn.Module):
         if output_hidden_states:
             outputs = outputs + (layer_hidden_states,)
         if output_attentions:
-            outputs = outputs + (layer_attentions,)
+            outputs = outputs + (layer_attentions, layer_cross_attentions, )
         return outputs  # last-layer hidden state, (layer hidden states), (layer attentions)
 
 
@@ -438,6 +504,8 @@ class AlbertTransformer(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
@@ -446,7 +514,7 @@ class AlbertTransformer(nn.Module):
 
         all_hidden_states = (hidden_states,) if output_hidden_states else None
         all_attentions = () if output_attentions else None
-
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         for i in range(self.config.num_hidden_layers):
             # Number of layers in a hidden group
             layers_per_group = int(self.config.num_hidden_layers / self.config.num_hidden_groups)
@@ -458,21 +526,25 @@ class AlbertTransformer(nn.Module):
                 hidden_states,
                 attention_mask,
                 head_mask[group_idx * layers_per_group : (group_idx + 1) * layers_per_group],
+                encoder_hidden_states,
+                encoder_attention_mask,
                 output_attentions,
                 output_hidden_states,
             )
             hidden_states = layer_group_output[0]
 
             if output_attentions:
-                all_attentions = all_attentions + layer_group_output[-1]
+                all_attentions = all_attentions + (layer_group_output[2], )
+                if self.config.add_cross_attention:
+                    all_cross_attentions = all_cross_attentions + (layer_group_output[3], )
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
+            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions, all_cross_attentions] if v is not None)
+        return BaseModelOutputWithCrossAttentions(
+            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions, cross_attentions=all_cross_attentions
         )
 
 
