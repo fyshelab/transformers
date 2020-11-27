@@ -35,6 +35,7 @@ from ...modeling_outputs import (
     BaseModelOutput,
     BaseModelOutputWithCrossAttentions,
     BaseModelOutputWithPooling,
+    CausalLMOutputWithCrossAttentions,
     MaskedLMOutput,
     MultipleChoiceModelOutput,
     QuestionAnsweringModelOutput,
@@ -515,7 +516,7 @@ class AlbertLayerGroup(nn.Module):
             if output_attentions:
                 layer_attentions = layer_attentions + (layer_output[1],)
                 if self.config.add_cross_attention:
-                    layer_cross_attentions = layer_cross_attentions + (layer_outputs[2],)
+                    layer_cross_attentions = layer_cross_attentions + (layer_output[2],)
 
             if output_hidden_states:
                 layer_hidden_states = layer_hidden_states + (hidden_states,)
@@ -843,6 +844,131 @@ class AlbertModel(AlbertPreTrainedModel):
         )
 
 
+class GenerationAlbertModel(AlbertPreTrainedModel):
+
+    config_class = AlbertConfig
+    load_tf_weights = load_tf_weights_in_albert
+    base_model_prefix = "albert"
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.config = config
+        self.embeddings = AlbertGenerationEmbeddings(config)
+        self.encoder = AlbertTransformer(config)
+        self.init_weights()
+
+    def get_input_embeddings(self):
+        return self.embeddings.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.embeddings.word_embeddings = value
+
+    def _resize_token_embeddings(self, new_num_tokens):
+        old_embeddings = self.embeddings.word_embeddings
+        new_embeddings = self._get_resized_embeddings(old_embeddings, new_num_tokens)
+        self.embeddings.word_embeddings = new_embeddings
+        return self.embeddings.word_embeddings
+
+    def _prune_heads(self, heads_to_prune):
+        """Prunes heads of the model. heads_to_prune: dict of {layer_num: list
+        of heads to prune in this layer} ALBERT has a different architecture in
+        that its layers are shared across groups, which then has inner groups.
+        If an ALBERT model has 12 hidden layers and 2 hidden groups, with two
+        inner groups, there is a total of 4 different layers.
+
+        These layers are flattened: the indices [0,1] correspond to the two inner groups of the first hidden layer,
+        while [2,3] correspond to the two inner groups of the second hidden layer.
+
+        Any layer with in index other than [0,1,2,3] will result in an error. See base class PreTrainedModel for more
+        information about head pruning
+        """
+        for layer, heads in heads_to_prune.items():
+            group_idx = int(layer / self.config.inner_group_num)
+            inner_group_idx = int(layer - group_idx * self.config.inner_group_num)
+            self.encoder.albert_layer_groups[group_idx].albert_layers[inner_group_idx].attention.prune_heads(heads)
+
+    @add_start_docstrings_to_model_forward(ALBERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        tokenizer_class=_TOKENIZER_FOR_DOC,
+        checkpoint="albert-base-v2",
+        output_type=BaseModelOutputWithCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        embedding_output = self.embeddings(input_ids, position_ids=position_ids, inputs_embeds=inputs_embeds)
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = encoder_outputs[0]
+
+        if not return_dict:
+            return (sequence_output,) + encoder_outputs[1:]
+
+        return BaseModelOutputWithCrossAttentions(
+            last_hidden_state=sequence_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+            cross_attentions=encoder_outputs.cross_attentions,
+        )
+
+
 @add_start_docstrings(
     """
     Albert Model with two heads on top as done during the pretraining: a `masked language modeling` head and a
@@ -946,6 +1072,129 @@ class AlbertForPreTraining(AlbertPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+class AlbertGenerationOnlyLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
+
+        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
+        self.decoder.bias = self.bias
+
+    def forward(self, hidden_states):
+        logits = self.decoder(hidden_states)
+        return logits
+
+
+class AlbertGenerationDecoder(AlbertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+
+        if not config.is_decoder:
+            logger.warn("If you want to use `AlbertGenerationDecoder` as a standalone, add `is_decoder=True.`")
+
+        self.bert = GenerationAlbertModel(config)
+        self.lm_head = AlbertGenerationOnlyLMHead(config)
+
+        self.init_weights()
+
+    def get_output_embeddings(self):
+        return self.lm_head.decoder
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        r"""
+        encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in ``[0, 1]``:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Labels for computing the left-to-right language modeling loss (next word prediction). Indices should be in
+            ``[-100, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring) Tokens with indices set to ``-100`` are
+            ignored (masked), the loss is only computed for the tokens with labels in ``[0, ..., config.vocab_size]``
+
+        Returns:
+
+        Example::
+
+            >>> from transformers import BertGenerationTokenizer, BertGenerationDecoder, BertGenerationConfig
+            >>> import torch
+
+            >>> tokenizer = BertGenerationTokenizer.from_pretrained('google/bert_for_seq_generation_L-24_bbc_encoder')
+            >>> config = BertGenerationConfig.from_pretrained("google/bert_for_seq_generation_L-24_bbc_encoder")
+            >>> config.is_decoder = True
+            >>> model = BertGenerationDecoder.from_pretrained('google/bert_for_seq_generation_L-24_bbc_encoder', config=config)
+
+            >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
+            >>> outputs = model(**inputs)
+
+            >>> prediction_logits = outputs.logits
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.bert(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+        prediction_scores = self.lm_head(sequence_output)
+
+        lm_loss = None
+        if labels is not None:
+            # we are doing next-token prediction; shift prediction scores and input ids by one
+            shifted_prediction_scores = prediction_scores[:, :-1, :].contiguous()
+            labels = labels[:, 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            lm_loss = loss_fct(shifted_prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (prediction_scores,) + outputs[1:]
+            return ((lm_loss,) + output) if lm_loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=lm_loss,
+            logits=prediction_scores,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
+        )
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **model_kwargs):
+        input_shape = input_ids.shape
+
+        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_shape)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
 class AlbertMLMHead(nn.Module):
