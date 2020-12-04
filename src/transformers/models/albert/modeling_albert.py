@@ -615,6 +615,27 @@ class AlbertPreTrainedModel(PreTrainedModel):
             module.weight.data.fill_(1.0)
 
 
+class GenerationAlbertPreTrainedModel(PreTrainedModel):
+    """An abstract class to handle weights initialization and a simple
+    interface for downloading and loading pretrained models."""
+
+    config_class = AlbertConfig
+    base_model_prefix = "albert"
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def _init_weights(self, module):
+        """Initialize the weights."""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if isinstance(module, (nn.Linear)) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+
 @dataclass
 class AlbertForPreTrainingOutput(ModelOutput):
     """Output type of :class:`~transformers.AlbertForPreTraining`.
@@ -844,7 +865,7 @@ class AlbertModel(AlbertPreTrainedModel):
         )
 
 
-class GenerationAlbertModel(AlbertPreTrainedModel):
+class GenerationAlbertModel(GenerationAlbertPreTrainedModel):
 
     config_class = AlbertConfig
     load_tf_weights = load_tf_weights_in_albert
@@ -1077,31 +1098,26 @@ class AlbertForPreTraining(AlbertPreTrainedModel):
 class AlbertGenerationOnlyLMHead(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.bias = nn.Parameter(torch.zeros(config.vocab_size))
-
-        # Need a link between the two variables so that the bias is correctly resized with `resize_token_embeddings`
-        self.decoder.bias = self.bias
+        self.lm_decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def forward(self, hidden_states):
-        logits = self.decoder(hidden_states)
+        logits = self.lm_decoder(hidden_states)
         return logits
 
 
-class AlbertGenerationDecoder(AlbertPreTrainedModel):
+class AlbertGenerationDecoder(GenerationAlbertPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
 
         if not config.is_decoder:
             logger.warn("If you want to use `AlbertGenerationDecoder` as a standalone, add `is_decoder=True.`")
 
-        self.bert = GenerationAlbertModel(config)
+        self.albert = GenerationAlbertModel(config)
         self.lm_head = AlbertGenerationOnlyLMHead(config)
-
         self.init_weights()
 
     def get_output_embeddings(self):
-        return self.lm_head.decoder
+        return self.lm_head.lm_decoder
 
     def forward(
         self,
@@ -1151,7 +1167,7 @@ class AlbertGenerationDecoder(AlbertPreTrainedModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        outputs = self.bert(
+        outputs = self.albert(
             input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
