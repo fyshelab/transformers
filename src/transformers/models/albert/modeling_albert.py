@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch ALBERT model. """
+"""PyTorch ALBERT model."""
 
 import math
 import os
@@ -33,7 +33,9 @@ from ...file_utils import (
 )
 from ...modeling_outputs import (
     BaseModelOutput,
+    BaseModelOutputWithCrossAttentions,
     BaseModelOutputWithPooling,
+    CausalLMOutputWithCrossAttentions,
     MaskedLMOutput,
     MultipleChoiceModelOutput,
     QuestionAnsweringModelOutput,
@@ -70,7 +72,7 @@ ALBERT_PRETRAINED_MODEL_ARCHIVE_LIST = [
 
 
 def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
-    """ Load tf checkpoints in a pytorch model."""
+    """Load tf checkpoints in a pytorch model."""
     try:
         import re
 
@@ -196,10 +198,46 @@ def load_tf_weights_in_albert(model, config, tf_checkpoint_path):
     return model
 
 
+class AlbertGenerationEmbeddings(nn.Module):
+    """Construct the embeddings from word, position and token_type
+    embeddings."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.embedding_size, padding_idx=config.pad_token_id)
+        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.embedding_size)
+        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
+        # any TensorFlow checkpoint file
+        self.LayerNorm = torch.nn.LayerNorm(config.embedding_size, eps=config.layer_norm_eps)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
+        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
+        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+
+    def forward(self, input_ids=None, position_ids=None, inputs_embeds=None):
+        if input_ids is not None:
+            input_shape = input_ids.size()
+        else:
+            input_shape = inputs_embeds.size()[:-1]
+
+        seq_length = input_shape[1]
+
+        if position_ids is None:
+            position_ids = self.position_ids[:, :seq_length]
+
+        if inputs_embeds is None:
+            inputs_embeds = self.word_embeddings(input_ids)
+        position_embeddings = self.position_embeddings(position_ids)
+
+        embeddings = inputs_embeds + position_embeddings
+        embeddings = self.LayerNorm(embeddings)
+        embeddings = self.dropout(embeddings)
+        return embeddings
+
+
 class AlbertEmbeddings(nn.Module):
-    """
-    Construct the embeddings from word, position and token_type embeddings.
-    """
+    """Construct the embeddings from word, position and token_type
+    embeddings."""
 
     def __init__(self, config):
         super().__init__()
@@ -297,10 +335,25 @@ class AlbertAttention(nn.Module):
         self.all_head_size = self.attention_head_size * self.num_attention_heads
         self.pruned_heads = self.pruned_heads.union(heads)
 
-    def forward(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+    ):
         mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+
+        # if values come from the encoder.
+        if encoder_hidden_states is not None:
+            mixed_key_layer = self.key(encoder_hidden_states)
+            mixed_value_layer = self.value(encoder_hidden_states)
+            attention_mask = encoder_attention_mask
+        else:
+            mixed_key_layer = self.key(hidden_states)
+            mixed_value_layer = self.value(hidden_states)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -368,25 +421,57 @@ class AlbertLayer(nn.Module):
         self.seq_len_dim = 1
         self.full_layer_layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.attention = AlbertAttention(config)
+        self.is_decoder = config.is_decoder
+        self.add_cross_attention = config.add_cross_attention
+        if self.add_cross_attention:
+            assert self.is_decoder, f"{self} should be used as a decoder model if cross attention is added"
+            self.crossattention = AlbertAttention(config)
         self.ffn = nn.Linear(config.hidden_size, config.intermediate_size)
         self.ffn_output = nn.Linear(config.intermediate_size, config.hidden_size)
         self.activation = ACT2FN[config.hidden_act]
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(
-        self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False, output_hidden_states=False
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+        output_hidden_states=False,
     ):
-        attention_output = self.attention(hidden_states, attention_mask, head_mask, output_attentions)
+        attention_outputs = self.attention(
+            hidden_states, attention_mask, head_mask, output_attentions=output_attentions
+        )
+
+        attention_output = attention_outputs[0]
+        outputs = attention_outputs[1:]
+
+        if self.is_decoder and encoder_hidden_states is not None:
+            assert hasattr(
+                self, "crossattention"
+            ), f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers by setting `config.add_cross_attention=True`"
+            cross_attention_outputs = self.crossattention(
+                attention_output,
+                attention_mask,
+                head_mask,
+                encoder_hidden_states,
+                encoder_attention_mask,
+                output_attentions,
+            )
+            attention_output = cross_attention_outputs[0]
+            outputs = outputs + cross_attention_outputs[1:]
 
         ffn_output = apply_chunking_to_forward(
             self.ff_chunk,
             self.chunk_size_feed_forward,
             self.seq_len_dim,
-            attention_output[0],
+            attention_output,
         )
-        hidden_states = self.full_layer_layer_norm(ffn_output + attention_output[0])
+        hidden_states = self.full_layer_layer_norm(ffn_output + attention_output)
 
-        return (hidden_states,) + attention_output[1:]  # add attentions if we output them
+        return (hidden_states,) + outputs  # add attentions if we output them
 
     def ff_chunk(self, attention_output):
         ffn_output = self.ffn(attention_output)
@@ -399,20 +484,39 @@ class AlbertLayerGroup(nn.Module):
     def __init__(self, config):
         super().__init__()
 
+        self.config = config
         self.albert_layers = nn.ModuleList([AlbertLayer(config) for _ in range(config.inner_group_num)])
 
     def forward(
-        self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False, output_hidden_states=False
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+        output_hidden_states=False,
     ):
         layer_hidden_states = ()
         layer_attentions = ()
+        layer_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
         for layer_index, albert_layer in enumerate(self.albert_layers):
-            layer_output = albert_layer(hidden_states, attention_mask, head_mask[layer_index], output_attentions)
+            layer_output = albert_layer(
+                hidden_states,
+                attention_mask,
+                head_mask[layer_index],
+                encoder_hidden_states,
+                encoder_attention_mask,
+                output_attentions,
+                output_hidden_states,
+            )
             hidden_states = layer_output[0]
 
             if output_attentions:
                 layer_attentions = layer_attentions + (layer_output[1],)
+                if self.config.add_cross_attention:
+                    layer_cross_attentions = layer_cross_attentions + (layer_output[2],)
 
             if output_hidden_states:
                 layer_hidden_states = layer_hidden_states + (hidden_states,)
@@ -421,7 +525,10 @@ class AlbertLayerGroup(nn.Module):
         if output_hidden_states:
             outputs = outputs + (layer_hidden_states,)
         if output_attentions:
-            outputs = outputs + (layer_attentions,)
+            outputs = outputs + (
+                layer_attentions,
+                layer_cross_attentions,
+            )
         return outputs  # last-layer hidden state, (layer hidden states), (layer attentions)
 
 
@@ -438,6 +545,8 @@ class AlbertTransformer(nn.Module):
         hidden_states,
         attention_mask=None,
         head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
@@ -446,7 +555,7 @@ class AlbertTransformer(nn.Module):
 
         all_hidden_states = (hidden_states,) if output_hidden_states else None
         all_attentions = () if output_attentions else None
-
+        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         for i in range(self.config.num_hidden_layers):
             # Number of layers in a hidden group
             layers_per_group = int(self.config.num_hidden_layers / self.config.num_hidden_groups)
@@ -458,29 +567,57 @@ class AlbertTransformer(nn.Module):
                 hidden_states,
                 attention_mask,
                 head_mask[group_idx * layers_per_group : (group_idx + 1) * layers_per_group],
+                encoder_hidden_states,
+                encoder_attention_mask,
                 output_attentions,
                 output_hidden_states,
             )
             hidden_states = layer_group_output[0]
 
             if output_attentions:
-                all_attentions = all_attentions + layer_group_output[-1]
+                all_attentions = all_attentions + (layer_group_output[2],)
+                if self.config.add_cross_attention:
+                    all_cross_attentions = all_cross_attentions + (layer_group_output[3],)
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=all_hidden_states, attentions=all_attentions
+            return tuple(
+                v for v in [hidden_states, all_hidden_states, all_attentions, all_cross_attentions] if v is not None
+            )
+        return BaseModelOutputWithCrossAttentions(
+            last_hidden_state=hidden_states,
+            hidden_states=all_hidden_states,
+            attentions=all_attentions,
+            cross_attentions=all_cross_attentions,
         )
 
 
 class AlbertPreTrainedModel(PreTrainedModel):
-    """
-    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
-    models.
-    """
+    """An abstract class to handle weights initialization and a simple
+    interface for downloading and loading pretrained models."""
+
+    config_class = AlbertConfig
+    base_model_prefix = "albert"
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def _init_weights(self, module):
+        """Initialize the weights."""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            if isinstance(module, (nn.Linear)) and module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+
+
+class GenerationAlbertPreTrainedModel(PreTrainedModel):
+    """An abstract class to handle weights initialization and a simple
+    interface for downloading and loading pretrained models."""
 
     config_class = AlbertConfig
     base_model_prefix = "albert"
@@ -501,8 +638,7 @@ class AlbertPreTrainedModel(PreTrainedModel):
 
 @dataclass
 class AlbertForPreTrainingOutput(ModelOutput):
-    """
-    Output type of :class:`~transformers.AlbertForPreTraining`.
+    """Output type of :class:`~transformers.AlbertForPreTraining`.
 
     Args:
         loss (`optional`, returned when ``labels`` is provided, ``torch.FloatTensor`` of shape :obj:`(1,)`):
@@ -639,10 +775,11 @@ class AlbertModel(AlbertPreTrainedModel):
         return self.embeddings.word_embeddings
 
     def _prune_heads(self, heads_to_prune):
-        """
-        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} ALBERT has
-        a different architecture in that its layers are shared across groups, which then has inner groups. If an ALBERT
-        model has 12 hidden layers and 2 hidden groups, with two inner groups, there is a total of 4 different layers.
+        """Prunes heads of the model. heads_to_prune: dict of {layer_num: list
+        of heads to prune in this layer} ALBERT has a different architecture in
+        that its layers are shared across groups, which then has inner groups.
+        If an ALBERT model has 12 hidden layers and 2 hidden groups, with two
+        inner groups, there is a total of 4 different layers.
 
         These layers are flattened: the indices [0,1] correspond to the two inner groups of the first hidden layer,
         while [2,3] correspond to the two inner groups of the second hidden layer.
@@ -725,6 +862,131 @@ class AlbertModel(AlbertPreTrainedModel):
             pooler_output=pooled_output,
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
+        )
+
+
+class GenerationAlbertModel(GenerationAlbertPreTrainedModel):
+
+    config_class = AlbertConfig
+    load_tf_weights = load_tf_weights_in_albert
+    base_model_prefix = "albert"
+
+    def __init__(self, config):
+        super().__init__(config)
+
+        self.config = config
+        self.embeddings = AlbertGenerationEmbeddings(config)
+        self.encoder = AlbertTransformer(config)
+        self.init_weights()
+
+    def get_input_embeddings(self):
+        return self.embeddings.word_embeddings
+
+    def set_input_embeddings(self, value):
+        self.embeddings.word_embeddings = value
+
+    def _resize_token_embeddings(self, new_num_tokens):
+        old_embeddings = self.embeddings.word_embeddings
+        new_embeddings = self._get_resized_embeddings(old_embeddings, new_num_tokens)
+        self.embeddings.word_embeddings = new_embeddings
+        return self.embeddings.word_embeddings
+
+    def _prune_heads(self, heads_to_prune):
+        """Prunes heads of the model. heads_to_prune: dict of {layer_num: list
+        of heads to prune in this layer} ALBERT has a different architecture in
+        that its layers are shared across groups, which then has inner groups.
+        If an ALBERT model has 12 hidden layers and 2 hidden groups, with two
+        inner groups, there is a total of 4 different layers.
+
+        These layers are flattened: the indices [0,1] correspond to the two inner groups of the first hidden layer,
+        while [2,3] correspond to the two inner groups of the second hidden layer.
+
+        Any layer with in index other than [0,1,2,3] will result in an error. See base class PreTrainedModel for more
+        information about head pruning
+        """
+        for layer, heads in heads_to_prune.items():
+            group_idx = int(layer / self.config.inner_group_num)
+            inner_group_idx = int(layer - group_idx * self.config.inner_group_num)
+            self.encoder.albert_layer_groups[group_idx].albert_layers[inner_group_idx].attention.prune_heads(heads)
+
+    @add_start_docstrings_to_model_forward(ALBERT_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
+    @add_code_sample_docstrings(
+        tokenizer_class=_TOKENIZER_FOR_DOC,
+        checkpoint="albert-base-v2",
+        output_type=BaseModelOutputWithCrossAttentions,
+        config_class=_CONFIG_FOR_DOC,
+    )
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if input_ids is not None and inputs_embeds is not None:
+            raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+        elif input_ids is not None:
+            input_shape = input_ids.size()
+        elif inputs_embeds is not None:
+            input_shape = inputs_embeds.size()[:-1]
+        else:
+            raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+        device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+        if attention_mask is None:
+            attention_mask = torch.ones(input_shape, device=device)
+
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+        extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+
+        # If a 2D or 3D attention mask is provided for the cross-attention
+        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+        if self.config.is_decoder and encoder_hidden_states is not None:
+            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
+            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
+            if encoder_attention_mask is None:
+                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
+            encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
+        else:
+            encoder_extended_attention_mask = None
+
+        embedding_output = self.embeddings(input_ids, position_ids=position_ids, inputs_embeds=inputs_embeds)
+        encoder_outputs = self.encoder(
+            embedding_output,
+            attention_mask=extended_attention_mask,
+            head_mask=head_mask,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_extended_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = encoder_outputs[0]
+
+        if not return_dict:
+            return (sequence_output,) + encoder_outputs[1:]
+
+        return BaseModelOutputWithCrossAttentions(
+            last_hidden_state=sequence_output,
+            hidden_states=encoder_outputs.hidden_states,
+            attentions=encoder_outputs.attentions,
+            cross_attentions=encoder_outputs.cross_attentions,
         )
 
 
@@ -831,6 +1093,124 @@ class AlbertForPreTraining(AlbertPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+class AlbertGenerationOnlyLMHead(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.lm_decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def forward(self, hidden_states):
+        logits = self.lm_decoder(hidden_states)
+        return logits
+
+
+class AlbertGenerationDecoder(GenerationAlbertPreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+
+        if not config.is_decoder:
+            logger.warn("If you want to use `AlbertGenerationDecoder` as a standalone, add `is_decoder=True.`")
+
+        self.albert = GenerationAlbertModel(config)
+        self.lm_head = AlbertGenerationOnlyLMHead(config)
+        self.init_weights()
+
+    def get_output_embeddings(self):
+        return self.lm_head.lm_decoder
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        r"""
+        encoder_hidden_states  (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length, hidden_size)`, `optional`):
+            Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
+            the model is configured as a decoder.
+        encoder_attention_mask (:obj:`torch.FloatTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Mask to avoid performing attention on the padding token indices of the encoder input. This mask is used in
+            the cross-attention if the model is configured as a decoder. Mask values selected in ``[0, 1]``:
+
+            - 1 for tokens that are **not masked**,
+            - 0 for tokens that are **masked**.
+        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
+            Labels for computing the left-to-right language modeling loss (next word prediction). Indices should be in
+            ``[-100, 0, ..., config.vocab_size]`` (see ``input_ids`` docstring) Tokens with indices set to ``-100`` are
+            ignored (masked), the loss is only computed for the tokens with labels in ``[0, ..., config.vocab_size]``
+
+        Returns:
+
+        Example::
+
+            >>> from transformers import BertGenerationTokenizer, BertGenerationDecoder, BertGenerationConfig
+            >>> import torch
+
+            >>> tokenizer = BertGenerationTokenizer.from_pretrained('google/bert_for_seq_generation_L-24_bbc_encoder')
+            >>> config = BertGenerationConfig.from_pretrained("google/bert_for_seq_generation_L-24_bbc_encoder")
+            >>> config.is_decoder = True
+            >>> model = BertGenerationDecoder.from_pretrained('google/bert_for_seq_generation_L-24_bbc_encoder', config=config)
+
+            >>> inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
+            >>> outputs = model(**inputs)
+
+            >>> prediction_logits = outputs.logits
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.albert(
+            input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_attention_mask=encoder_attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = outputs[0]
+        prediction_scores = self.lm_head(sequence_output)
+
+        lm_loss = None
+        if labels is not None:
+            # we are doing next-token prediction; shift prediction scores and input ids by one
+            shifted_prediction_scores = prediction_scores[:, :-1, :].contiguous()
+            labels = labels[:, 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            lm_loss = loss_fct(shifted_prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+
+        if not return_dict:
+            output = (prediction_scores,) + outputs[1:]
+            return ((lm_loss,) + output) if lm_loss is not None else output
+
+        return CausalLMOutputWithCrossAttentions(
+            loss=lm_loss,
+            logits=prediction_scores,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            cross_attentions=outputs.cross_attentions,
+        )
+
+    def prepare_inputs_for_generation(self, input_ids, attention_mask=None, **model_kwargs):
+        input_shape = input_ids.shape
+
+        # if model is used as a decoder in encoder-decoder model, the decoder attention mask is created on the fly
+        if attention_mask is None:
+            attention_mask = input_ids.new_ones(input_shape)
+
+        return {"input_ids": input_ids, "attention_mask": attention_mask}
 
 
 class AlbertMLMHead(nn.Module):
