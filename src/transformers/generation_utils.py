@@ -1510,6 +1510,11 @@ class GenerationMixin:
 
         this_peer_finished = False  # used by synced_gpus only
         # auto-regressive generation
+
+        # Added by Saeed
+        token_bias = model_kwargs["token_bias"]  # with size: (batch_size * num_samples, seq_len)
+        len_index = cur_len - 1
+
         while True:
 
             if synced_gpus:
@@ -1535,6 +1540,7 @@ class GenerationMixin:
 
             if synced_gpus and this_peer_finished:
                 cur_len = cur_len + 1
+                len_index += 1
                 continue  # don't waste resources running the code we don't need
 
             next_token_logits = outputs.logits[:, -1, :]
@@ -1542,6 +1548,7 @@ class GenerationMixin:
             # pre-process distribution
             next_token_scores = logits_processor(input_ids, next_token_logits)
             next_token_scores = logits_warper(input_ids, next_token_scores)
+            
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -1565,6 +1572,11 @@ class GenerationMixin:
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
 
+            # Added by Saeed.
+            len_token_bias = token_bias[:, len_index].squeeze()
+            token_bias_mask = (len_token_bias == -1)
+            next_tokens = next_tokens * token_bias_mask + len_token_bias * (1 - token_bias_mask)
+
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
                 assert pad_token_id is not None, "If eos_token_id is defined, make sure that pad_token_id is defined."
@@ -1576,6 +1588,7 @@ class GenerationMixin:
                 outputs, model_kwargs, is_encoder_decoder=self.config.is_encoder_decoder
             )
             cur_len = cur_len + 1
+            len_index += 1
 
             # if eos_token was found in one sentence, set sentence to finished
             if eos_token_id is not None:
